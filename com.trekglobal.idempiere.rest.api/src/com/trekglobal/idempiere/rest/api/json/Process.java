@@ -83,7 +83,7 @@ public class Process {
 	 * @return MPInstance
 	 */
 	public static MPInstance createPInstance(MProcess process, JsonObject jsonObject, boolean runAsJob) {
-		MPInstance pInstance = new MPInstance(process, 0, 0, null);
+		MPInstance pInstance = new MPInstance(process, 0);
 		MPInstancePara[] iParams = pInstance.getParameters();
 		for(MPInstancePara iParam : iParams) {
 			MProcessPara processPara = process.getParameter(iParam.getParameterName());
