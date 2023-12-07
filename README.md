@@ -3,6 +3,12 @@
 
 You can find the documentation on how to use it here: https://wiki.idempiere.org/en/REST_Web_Services.
 
+## DEV env setup
+```
+$ cd /home/vagrant/idempiere-dev-setup
+$ git clone --branch release-10 git@github.com:trifonnt/idempiere-rest.git
+```
+
 ## Projects:
 * com.trekglobal.idempiere.extensions.parent - parent pom project
 * com.trekglobal.idempiere.rest.api - rest api project
