@@ -25,13 +25,17 @@
 **********************************************************************/
 package com.trekglobal.idempiere.rest.api.json;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 
+import org.adempiere.exceptions.AdempiereException;
 import org.compiere.model.GridField;
 import org.compiere.model.GridFieldVO;
 import org.compiere.model.MColumn;
-import org.compiere.model.MTable;
+import org.compiere.model.MRole;
 import org.compiere.model.MSysConfig;
+import org.compiere.model.MTable;
 import org.compiere.model.PO;
 import org.compiere.model.POInfo;
 import org.compiere.util.DisplayType;
@@ -39,6 +43,7 @@ import org.compiere.util.Env;
 import org.compiere.util.Util;
 import org.osgi.service.component.annotations.Component;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
@@ -88,6 +93,8 @@ public class DefaultPOSerializer implements IPOSerializer, IPOSerializerFactory 
 			MColumn column = MColumn.get(Env.getCtx(), poInfo.getAD_Column_ID(columnName));
 			if (column.isSecure() || column.isEncrypted())
 				continue;
+			if (!hasRoleColumnAccess(po.get_Table_ID(), column.getAD_Column_ID(), true))
+				continue;
 
 			Object value ;
 			if (column.isTranslated())
@@ -121,6 +128,7 @@ public class DefaultPOSerializer implements IPOSerializer, IPOSerializerFactory 
 	public PO fromJson(JsonObject json, MTable table) {
 		PO po = table.getPO(0, null);
 		POInfo poInfo = POInfo.getPOInfo(Env.getCtx(), table.getAD_Table_ID());
+		validateJsonFields(json, po);
 		Set<String> jsonFields = json.keySet();
 		for(int i = 0; i < poInfo.getColumnCount(); i++) {
 			String columnName = poInfo.getColumnName(i);
@@ -130,9 +138,9 @@ public class DefaultPOSerializer implements IPOSerializer, IPOSerializerFactory 
 				setDefaultValue(po, column);
 				continue;
 			}
-			if (column.isSecure() || column.isEncrypted() || column.isVirtualColumn())
+			if (! isUpdatable(column, false))
 				continue;
-			
+
 			JsonElement field = json.get(propertyName);
 			if (field == null)
 				field = json.get(columnName);
@@ -161,6 +169,7 @@ public class DefaultPOSerializer implements IPOSerializer, IPOSerializerFactory 
 	public PO fromJson(JsonObject json, PO po) {
 		MTable table = MTable.get(Env.getCtx(), po.get_Table_ID());
 		POInfo poInfo = POInfo.getPOInfo(Env.getCtx(), table.getAD_Table_ID());
+		validateJsonFields(json, po);
 		Set<String> jsonFields = json.keySet();
 		for(int i = 0; i < poInfo.getColumnCount(); i++) {
 			String columnName = poInfo.getColumnName(i);
@@ -173,20 +182,27 @@ public class DefaultPOSerializer implements IPOSerializer, IPOSerializerFactory 
 				field = json.get(columnName);
 			if (field == null)
 				continue;
-			if (!column.isUpdateable())
+			if (! isUpdatable(column, true))
 				continue;
-			if (column.isSecure() || column.isEncrypted())
-				continue;
+			boolean errorOnNonUpdatable = MSysConfig.getBooleanValue("REST_ERROR_ON_NON_UPDATABLE_COLUMN", true);
 			if (po.get_ColumnIndex("processed") >= 0) {
 				if (po.get_ValueAsBoolean("processed")) {
-					if (!column.isAlwaysUpdateable())
-						continue;
+					if (!column.isAlwaysUpdateable()) {
+						if (errorOnNonUpdatable)
+							throw new AdempiereException("Cannot update " + columnName + " on processed record");
+						else
+							continue;
+					}
 				}
 			}
 			if (po.get_ColumnIndex("posted") >= 0) {
 				if (po.get_ValueAsBoolean("posted")) {
-					if (!column.isAlwaysUpdateable())
-						continue;
+					if (!column.isAlwaysUpdateable()) {
+						if (errorOnNonUpdatable)
+							throw new AdempiereException("Cannot update " + columnName + " on posted record");
+						else
+							continue;
+					}
 				}
 			}
 			Object value = TypeConverterUtils.fromJsonValue(column, field);
@@ -205,7 +221,84 @@ public class DefaultPOSerializer implements IPOSerializer, IPOSerializerFactory 
 		
 		return po;
 	}
-	
+
+	/**
+	 * Validate if a column can be updated
+	 * @param column
+	 * @param validateUpdateable
+	 * @return true if it can be updated, throws AdempiereException depending on the SysConfig keys REST_ERROR_ON_NON_UPDATABLE_COLUMN and REST_ALLOW_UPDATE_SECURE_COLUMN
+	 */
+	private boolean isUpdatable(MColumn column, boolean validateUpdateable) {
+		boolean errorOnNonUpdatable = MSysConfig.getBooleanValue("REST_ERROR_ON_NON_UPDATABLE_COLUMN", true);
+		if (validateUpdateable && !column.isUpdateable()) {
+			if (errorOnNonUpdatable)
+				throw new AdempiereException("Cannot update column " + column.getColumnName());
+			else
+				return false;
+		}
+		if (column.isVirtualColumn()) {
+			if (errorOnNonUpdatable)
+				throw new AdempiereException("Cannot update virtual column " + column.getColumnName());
+			else
+				return false;
+		}
+		boolean allowUpdateSecure = MSysConfig.getBooleanValue("REST_ALLOW_UPDATE_SECURE_COLUMN", true);
+		if (! allowUpdateSecure) {
+			if (column.isSecure() || column.isEncrypted()) {
+				if (errorOnNonUpdatable)
+					throw new AdempiereException("Cannot update secure/encrypted column " + column.getColumnName());
+				else
+					return false;
+			}
+		}
+		
+		if (!hasRoleColumnAccess(column.getAD_Table_ID(), column.getAD_Column_ID(), false)) {
+			if (errorOnNonUpdatable)
+				throw new AdempiereException("Cannot update column " + column.getColumnName());
+			else
+				return false;
+		}
+			
+		return true;
+	}
+
+	final List<String> ALLOWED_EXTRA_COLUMNS = new ArrayList<>(
+			List.of(
+					"doc-action",
+					"id",
+					"identifier",
+					"model-name",
+					"tableName",
+					"uid"
+					));
+
+	/**
+	 * Validate that all json fields exist as columns and are properly named
+	 * @param json
+	 * @param po
+	 */
+	private void validateJsonFields(JsonObject json, PO po) {
+		boolean errorOnNonExisting = MSysConfig.getBooleanValue("REST_ERROR_ON_NON_EXISTING_COLUMN", true);
+		Set<String> jsonFields = json.keySet();
+		if (errorOnNonExisting) {
+			for (String jsonField : jsonFields) {
+				if (ALLOWED_EXTRA_COLUMNS.contains(jsonField))
+					continue;
+				JsonElement jsonObj = json.get(jsonField);
+				if (jsonObj instanceof JsonArray)
+					continue;
+				int colIdx = po.get_ColumnIndex(jsonField);
+				if (colIdx < 0)
+					throw new AdempiereException("Column " + jsonField + " does not exist");
+				String columnName = po.get_ColumnName(colIdx);
+				String propertyName = TypeConverterUtils.toPropertyName(columnName);
+				if (! jsonField.equals(propertyName) && !jsonField.equals(columnName))
+					throw new AdempiereException("Wrong name for column " + jsonField + ", you must use " + propertyName +
+							(propertyName.equals(columnName) ? "" : " or " + columnName));
+			}
+		}
+	}
+
 	private boolean exclude(String columnName, String[] excludes) {
 		if (excludes == null || excludes.length == 0)
 			return false;
@@ -224,6 +317,18 @@ public class DefaultPOSerializer implements IPOSerializer, IPOSerializerFactory 
 				return true;
 		}
 		return false;
+	}
+	
+	/**
+	 * Check if the role has access to this column
+	 * @param AD_Table_ID
+	 * @param AD_Column_ID
+	 * @param readOnly
+	 * @return true if user has access
+	 */
+	private boolean hasRoleColumnAccess(int AD_Table_ID, int AD_Column_ID, boolean readOnly) {
+		return MRole.getDefault(Env.getCtx(), false).isColumnAccess(AD_Table_ID, AD_Column_ID, readOnly);
+
 	}
 	
 	private void setDefaultValue(PO po, MColumn column) {
